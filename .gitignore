@@ -16,3 +16,5 @@ local.properties
 *.keystore
 *.log
 *.tmp
+# Pre-built native libraries (download via setup script)
+*.so

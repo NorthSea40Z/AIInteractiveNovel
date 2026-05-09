@@ -28,8 +28,8 @@ struct LlamaState {
     std::vector<int8_t> logits_buf;
 };
 
-static float rep_penalty = 1.15f;
-static int rep_penalty_range = 64;
+static float rep_penalty = 1.25f;
+static int rep_penalty_range = 128;
 
 static llama_token sample_token(const float *logits, int n_vocab, const std::vector<llama_token> &recent) {
     // Find max

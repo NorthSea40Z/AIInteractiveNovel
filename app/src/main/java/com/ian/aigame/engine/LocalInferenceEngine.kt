@@ -86,17 +86,16 @@ class LocalInferenceEngine(private val appContext: Context) {
         if (nativePtr == 0L) return@withContext StoryPreview(title = "${theme.displayName} Adventure", opening = "Engine not ready", theme = theme, settings = com.ian.aigame.model.GameSettings(theme = theme))
         NativeLLM.resetContext(nativePtr)
         try {
-            val response = NativeLLM.generate(nativePtr, "一段${theme.displayName}互動小說的故事：\n", 256)
+            val response = NativeLLM.generate(nativePtr, "這是一個${theme.displayName}互動小說的起點。寫出開場情境，建立懸念，不要結局：\n", 128)
             Log.i("AIGAME", "Raw preview: $response")
             val raw = response ?: ""
-            val cleaned = raw.trim()
-            val lines = cleaned.split('\n').filter { it.isNotBlank() }
-            val title = lines.firstOrNull()?.take(30) ?: "${theme.displayName}傳說"
-            var opening = lines.drop(1).joinToString("\n").take(500).ifBlank { cleaned.take(200) }
-            val sentenceEndings = listOf('.', '!', '?', '\u3002', '\u3001', '\uFF01', '\uFF1F')
-            if (opening.length >= 490 && sentenceEndings.none { opening.endsWith(it.toString()) }) {
-            val idx = opening.indexOfLast { it in sentenceEndings }
-                if (idx > 0) opening = opening.substring(0, idx + 1)
+            val cleaned = raw.trim().substringBefore("Human:").substringBefore("Assistant:").trim()
+            val title = "${theme.displayName}冒險"
+            var opening = truncateRepetition(cleaned).take(500)
+            val endings = setOf('\u3002', '\uFF01', '\uFF1F', '!', '?', '.')
+            if (opening.lastOrNull() !in endings) {
+                val cut = opening.indexOfLast { it in endings }
+                if (cut >= 10) opening = opening.substring(0, cut + 1)
             }
 
             StoryPreview(title = title, opening = opening, theme = theme, settings = com.ian.aigame.model.GameSettings(theme = theme))
@@ -113,12 +112,16 @@ class LocalInferenceEngine(private val appContext: Context) {
             val context = buildStoryContext(theme, storySoFar, round, maxRounds)
             Log.i("AIGAME", "Generating segment $round, context: ${context.take(100)}...")
 
-            val narrative = NativeLLM.generate(nativePtr, "$context\n\n故事繼續：", 128) ?: ""
+            val narrative = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n\n故事繼續：", 128) ?: "")
+                .substringBefore("Human:").substringBefore("Assistant:").trim())
             Log.i("AIGAME", "Narrative($round): $narrative")
 
-            val opt1 = NativeLLM.generate(nativePtr, "$context\n$narrative\n\n玩家選擇：", 32) ?: ""
-            val opt2 = NativeLLM.generate(nativePtr, "$context\n$narrative\n\n另一個選擇：", 32) ?: ""
-            val opt3 = NativeLLM.generate(nativePtr, "$context\n$narrative\n\n第三個選擇：", 32) ?: ""
+            val opt1 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n玩家選擇：", 32) ?: "")
+                .substringBefore("Human:").substringBefore("Assistant:").trim())
+            val opt2 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n另一個選擇：", 32) ?: "")
+                .substringBefore("Human:").substringBefore("Assistant:").trim())
+            val opt3 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n第三個選擇：", 32) ?: "")
+                .substringBefore("Human:").substringBefore("Assistant:").trim())
             Log.i("AIGAME", "Options($round): 1=$opt1 2=$opt2 3=$opt3")
 
             val opts = listOfNotNull(
@@ -147,12 +150,12 @@ class LocalInferenceEngine(private val appContext: Context) {
     }
 
     private fun segFallback(round: Int) = StorySegment(
-        id = "seg_${round}_${System.currentTimeMillis()}", narrative = "Story continues...",
+        id = "seg_${round}_${System.currentTimeMillis()}", narrative = "故事繼續中",
         dialogue = null, speaker = null,
         options = listOf(
-            StoryOption("opt_${round}_0", "Continue"),
-            StoryOption("opt_${round}_1", "Look around"),
-            StoryOption("opt_${round}_2", "Move forward")
+            StoryOption("opt_${round}_0", "繼續前進"),
+            StoryOption("opt_${round}_1", "觀察四周"),
+            StoryOption("opt_${round}_2", "往前探索")
         )
     )
 
@@ -209,4 +212,24 @@ class PromptBuilder {
         } else options
         return StorySegment(id = "seg_${round}_${System.currentTimeMillis()}", narrative = finalNarrative, dialogue = dialogue, speaker = speaker, options = finalOptions)
     }
+}
+
+private fun truncateRepetition(text: String): String {
+    if (text.length < 10) return text
+    var bestCut = text.length
+    for (len in 1..6) {
+        var i = 0
+        while (i <= text.length - len * 3) {
+            val segment = text.substring(i, i + len)
+            val next = text.substring(i + len, (i + len * 2).coerceAtMost(text.length))
+            val next2 = text.substring(i + len * 2, (i + len * 3).coerceAtMost(text.length))
+            if (segment == next && segment == next2) {
+                val repeatEnd = text.indexOfFirst { it != segment[0] }
+                if (repeatEnd > i + len) bestCut = bestCut.coerceAtMost(repeatEnd)
+                break
+            }
+            i++
+        }
+    }
+    return if (bestCut < text.length) text.substring(0, bestCut) else text
 }

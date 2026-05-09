@@ -96,7 +96,10 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         val currentSegment = current.currentSegment ?: return
         val newRound = current.round + 1
         val isEnding = newRound > current.maxRounds || option.isEnding
-        val updatedStory = current.storySoFar + currentSegment
+        val segmentWithChoice = currentSegment.copy(
+            narrative = "${currentSegment.narrative}\n（你選擇了：${option.text}）"
+        )
+        val updatedStory = current.storySoFar + segmentWithChoice
 
         _gameState.update { it.copy(storySoFar = updatedStory, isGenerating = true, currentSegment = null) }
         viewModelScope.launch(Dispatchers.Default) {

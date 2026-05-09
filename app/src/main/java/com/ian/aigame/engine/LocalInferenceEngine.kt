@@ -122,24 +122,15 @@ class LocalInferenceEngine(private val appContext: Context) {
             }
             Log.i("AIGAME", "Narrative($round): $narrative")
 
-            val opt1 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n給玩家一個行動選項：", 32) ?: "")
+            val optionsRaw = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n請生成三個不同的選項讓玩家選擇：\n選項1：\n選項2：\n選項3：", 96) ?: "")
                 .substringBefore("Human:").substringBefore("Assistant:").trim())
-            val opt2 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n給玩家一個完全不同的選擇，不要跟上一個相同：", 32) ?: "")
-                .substringBefore("Human:").substringBefore("Assistant:").trim())
-            val opt3 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n給玩家第三個選擇，跟前面兩個都不同：", 32) ?: "")
-                .substringBefore("Human:").substringBefore("Assistant:").trim())
-            Log.i("AIGAME", "Options($round): 1=$opt1 2=$opt2 3=$opt3")
-
-            val opts = listOfNotNull(
-                if (opt1.isNotBlank()) StoryOption("opt_${round}_0", opt1.take(60)) else null,
-                if (opt2.isNotBlank()) StoryOption("opt_${round}_1", opt2.take(60)) else null,
-                if (opt3.isNotBlank()) StoryOption("opt_${round}_2", opt3.take(60)) else null
-            )
+            Log.i("AIGAME", "Options raw($round): $optionsRaw")
+            val options = parseOptions(optionsRaw, round)
 
             StorySegment(id = "seg_${round}_${System.currentTimeMillis()}",
                 narrative = narrative.ifBlank { "故事繼續進行..." },
                 dialogue = null, speaker = null,
-                options = if (opts.isNotEmpty()) opts else segFallback(round).options
+                options = if (options.isNotEmpty()) options else segFallback(round).options
             )
         } catch (e: Exception) {
             Log.e("AIGAME", "Segment error", e)
@@ -220,22 +211,34 @@ class PromptBuilder {
     }
 }
 
-private fun truncateRepetition(text: String): String {
-    if (text.length < 10) return text
-    var bestCut = text.length
-    for (len in 1..6) {
-        var i = 0
-        while (i <= text.length - len * 3) {
-            val segment = text.substring(i, i + len)
-            val next = text.substring(i + len, (i + len * 2).coerceAtMost(text.length))
-            val next2 = text.substring(i + len * 2, (i + len * 3).coerceAtMost(text.length))
-            if (segment == next && segment == next2) {
-                val repeatEnd = text.indexOfFirst { it != segment[0] }
-                if (repeatEnd > i + len) bestCut = bestCut.coerceAtMost(repeatEnd)
-                break
+    private fun truncateRepetition(text: String): String {
+        if (text.length < 10) return text
+        var bestCut = text.length
+        for (len in 1..6) {
+            var i = 0
+            while (i <= text.length - len * 3) {
+                val segment = text.substring(i, i + len)
+                val next = text.substring(i + len, (i + len * 2).coerceAtMost(text.length))
+                val next2 = text.substring(i + len * 2, (i + len * 3).coerceAtMost(text.length))
+                if (segment == next && segment == next2) {
+                    val repeatEnd = text.indexOfFirst { it != segment[0] }
+                    if (repeatEnd > i + len) bestCut = bestCut.coerceAtMost(repeatEnd)
+                    break
+                }
+                i++
             }
-            i++
         }
+        return if (bestCut < text.length) text.substring(0, bestCut) else text
     }
-    return if (bestCut < text.length) text.substring(0, bestCut) else text
-}
+
+    private fun parseOptions(raw: String, round: Int): List<StoryOption> {
+        fun clean(s: String) = s.removePrefix("「").removeSuffix("」").removePrefix("\"").removeSuffix("\"").trim()
+        val opt1 = clean(raw.substringAfter("選項1：").substringBefore("\n").take(60))
+        val opt2 = clean(raw.substringAfter("選項2：").substringBefore("\n").take(60))
+        val opt3 = clean(raw.substringAfter("選項3：").substringBefore("\n").take(60))
+        return listOfNotNull(
+            if (opt1.isNotBlank()) StoryOption("opt_${round}_0", opt1) else null,
+            if (opt2.isNotBlank()) StoryOption("opt_${round}_1", opt2) else null,
+            if (opt3.isNotBlank()) StoryOption("opt_${round}_2", opt3) else null
+        )
+    }

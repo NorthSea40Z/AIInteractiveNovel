@@ -24,5 +24,6 @@ object NativeLLM {
 
     external fun init(modelPath: String): Long
     external fun generate(ptr: Long, prompt: String, maxTokens: Int): String
+    external fun resetContext(ptr: Long)
     external fun close(ptr: Long)
 }

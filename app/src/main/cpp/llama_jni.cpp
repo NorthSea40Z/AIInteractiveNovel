@@ -18,30 +18,47 @@ struct LlamaState {
     llama_model *model = nullptr;
     llama_context *ctx = nullptr;
     const llama_vocab *vocab = nullptr;
+    std::vector<llama_token> recent_tokens;
+    int kv_pos = 0;
+    llama_token im_end_id = -1;
+    std::vector<int32_t> pos_buf;
+    std::vector<int32_t> n_seq_id_buf;
+    std::vector<llama_seq_id*> seq_id_ptr_buf;
+    std::vector<llama_seq_id> seq_id_flat;
+    std::vector<int8_t> logits_buf;
 };
 
-static llama_token sample_token(const float *logits, int n_vocab) {
+static float rep_penalty = 1.15f;
+static int rep_penalty_range = 64;
+
+static llama_token sample_token(const float *logits, int n_vocab, const std::vector<llama_token> &recent) {
     // Find max
     float max_val = logits[0];
     for (int i = 1; i < n_vocab; i++) {
         if (logits[i] > max_val) max_val = logits[i];
     }
-    // Apply temperature and compute softmax up to top-k
+    // Apply temperature and repetition penalty
     float temp = 0.8f;
     int top_k = 40;
     std::vector<std::pair<float, int>> candidates;
     candidates.reserve(top_k);
+    int start = std::max(0, (int)recent.size() - rep_penalty_range);
     for (int i = 0; i < n_vocab; i++) {
-        if (logits[i] > max_val - 3.0f) { // only consider reasonably likely tokens
-            candidates.push_back({expf((logits[i] - max_val) / temp), i});
+        if (logits[i] > max_val - 4.0f) { // wider window for more diversity
+            float score = expf((logits[i] - max_val) / temp);
+            // Apply repetition penalty
+            for (int j = start; j < (int)recent.size(); j++) {
+                if (recent[j] == i) {
+                    score /= rep_penalty;
+                    break;
+                }
+            }
+            candidates.push_back({score, i});
         }
     }
-    // Sort by probability descending
     std::sort(candidates.begin(), candidates.end(),
         [](auto &a, auto &b) { return a.first > b.first; });
-    // Keep top-k
     if ((int)candidates.size() > top_k) candidates.resize(top_k);
-    // Normalize and sample
     float sum = 0;
     for (auto &c : candidates) sum += c.first;
     float r = (float)rand() / (float)RAND_MAX * sum;
@@ -98,13 +115,18 @@ JNIEXPORT jlong JNICALL Java_com_ian_aigame_engine_NativeLLM_init(JNIEnv *env, j
 
     LOGI("Creating context with n_ctx=2048");
     auto cparams = llama_context_default_params();
-    cparams.n_ctx = 2048;
+    cparams.n_ctx = 16384;
     llama_context *ctx = llama_init_from_model(model, cparams);
     if (!ctx) { LOGE("llama_init_from_model failed"); llama_model_free(model); return 0; }
 
     const llama_vocab *vocab = llama_model_get_vocab(model);
     auto *state = new LlamaState{model, ctx, vocab};
-    LOGI("Model loaded successfully, ptr=%p", state);
+    // Look up <|im_end|> token ID for early termination
+    const char *end_marker = "<|im_end|>";
+    std::vector<llama_token> end_tokens(4);
+    int n_end = llama_tokenize(vocab, end_marker, strlen(end_marker), end_tokens.data(), (int)end_tokens.size(), false, false);
+    if (n_end > 0) state->im_end_id = end_tokens[0];
+    LOGI("Model loaded, im_end_id=%d, state=%p", state->im_end_id, state);
     return (jlong)state;
 }
 
@@ -115,10 +137,11 @@ JNIEXPORT jstring JNICALL Java_com_ian_aigame_engine_NativeLLM_generate(
     if (!state || !state->model || !state->ctx) return env->NewStringUTF("");
 
     const char *prompt_str = env->GetStringUTFChars(prompt, nullptr);
-    std::string input(prompt_str);
+    std::string input = "<|im_start|>system\n你是一個互動小說作家。只輸出繁體中文故事。不要輸出格式標記。<|im_end|>\n<|im_start|>user\n";
+    input += prompt_str;
+    input += "<|im_end|>\n<|im_start|>assistant\n";
     env->ReleaseStringUTFChars(prompt, prompt_str);
-    input = "<|im_start|>system\n你是一個互動小說創作者，請用繁體中文創作故事。請嚴格按照格式回覆。<|im_end|>\n<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
-
+    LOGI("Generate, max=%d", max_tokens);
     std::vector<llama_token> tokens(4096);
     int n_tokens = llama_tokenize(state->vocab, input.c_str(), input.length(), tokens.data(), (int)tokens.size(), true, false);
     if (n_tokens <= 0) return env->NewStringUTF("");
@@ -128,60 +151,74 @@ JNIEXPORT jstring JNICALL Java_com_ian_aigame_engine_NativeLLM_generate(
     int n_vocab = llama_vocab_n_tokens(state->vocab);
     llama_token eos = llama_vocab_eos(state->vocab);
 
-    // Decode prompt using properly initialized batch
-    llama_batch prompt_batch = llama_batch_init(n_tokens, 0, 1);
-    prompt_batch.n_tokens = n_tokens;
+    // Build prompt batch (llama_batch_get_one returns stack struct, no heap)
+    int prompt_start = state->kv_pos;
+    // Allocate state buffers for batch metadata
+    state->pos_buf.resize(n_tokens);
+    state->n_seq_id_buf.resize(n_tokens);
+    state->logits_buf.resize(n_tokens);
+    state->seq_id_flat.resize(n_tokens);
+    state->seq_id_ptr_buf.resize(n_tokens);
     for (int i = 0; i < n_tokens; i++) {
-        prompt_batch.token[i] = tokens[i];
-        prompt_batch.pos[i] = i;
-        prompt_batch.n_seq_id[i] = 1;
-        prompt_batch.seq_id[i][0] = 0;
-        prompt_batch.logits[i] = (i == n_tokens - 1);
+        state->pos_buf[i]    = prompt_start + i;
+        state->n_seq_id_buf[i] = 1;
+        state->logits_buf[i] = (i == n_tokens - 1);
+        state->seq_id_flat[i] = 0;
+        state->seq_id_ptr_buf[i] = &state->seq_id_flat[i];
     }
-    if (llama_decode(state->ctx, prompt_batch)) { llama_batch_free(prompt_batch); return env->NewStringUTF(""); }
-    LOGI("Prompt decoded, %d tokens", n_tokens);
+    struct llama_batch prompt_batch = llama_batch_get_one(tokens.data(), n_tokens);
+    prompt_batch.pos     = state->pos_buf.data();
+    prompt_batch.n_seq_id = state->n_seq_id_buf.data();
+    prompt_batch.seq_id  = state->seq_id_ptr_buf.data();
+    prompt_batch.logits  = state->logits_buf.data();
+    if (llama_decode(state->ctx, prompt_batch)) return env->NewStringUTF("");
+    LOGI("Prompt decoded, %d tokens at pos %d", n_tokens, prompt_start);
 
-    // Generate tokens
+    const float *first_logits = llama_get_logits_ith(state->ctx, n_tokens - 1);
+    if (!first_logits) return env->NewStringUTF("");
+    state->recent_tokens.clear();
+    llama_token next_token = sample_token(first_logits, n_vocab, state->recent_tokens);
+    int n_pos = prompt_start + n_tokens;
+    int max_gen = (max_tokens < 512) ? max_tokens : 512;
     std::vector<unsigned char> result_bytes;
     result_bytes.reserve(4096);
-    llama_batch gen_batch = llama_batch_init(1, 0, 1);
-    int max_gen = (max_tokens < 512) ? max_tokens : 512;
-    int n_pos = n_tokens;
-
-    // First sample: get logits from last prompt token
-    const float *first_logits = llama_get_logits_ith(state->ctx, n_tokens - 1);
-    if (!first_logits) { llama_batch_free(prompt_batch); llama_batch_free(gen_batch); return env->NewStringUTF(""); }
-    llama_token next_token = sample_token(first_logits, n_vocab);
 
     for (int i = 0; i < max_gen; i++) {
         LOGI("Token %d: id=%d", i, next_token);
         if (next_token == eos) { LOGI("Break: EOS"); break; }
+        if (next_token == state->im_end_id) { LOGI("Break: im_end"); break; }
 
         char buf[64];
-        int len = llama_token_to_piece(state->vocab, next_token, buf, sizeof(buf), 0, false);
+        int len = llama_token_to_piece(state->vocab, next_token, buf, sizeof(buf) - 1, 0, false);
         if (len > 0) {
-            if (len == 10 && memcmp(buf, "<|im_end|>", 10) == 0) { LOGI("Break: im_end"); break; }
             for (int j = 0; j < len; j++) result_bytes.push_back((unsigned char)buf[j]);
         }
 
-        gen_batch.n_tokens = 1;
-        gen_batch.token[0] = next_token;
-        gen_batch.pos[0] = n_pos++;
-        gen_batch.n_seq_id[0] = 1;
-        gen_batch.seq_id[0][0] = 0;
-        gen_batch.logits[0] = true;
-
+        int32_t gen_pos = n_pos++;
+        int32_t gen_n_seq = 1;
+        int8_t gen_logit = 1;
+        llama_seq_id gen_seq_val[1] = {0};
+        llama_seq_id *gen_seq_ptr[1] = {gen_seq_val};
+        struct llama_batch gen_batch = llama_batch_get_one(&next_token, 1);
+        gen_batch.pos = &gen_pos;
+        gen_batch.n_seq_id = &gen_n_seq;
+        gen_batch.seq_id = gen_seq_ptr;
+        gen_batch.logits = &gen_logit;
         if (llama_decode(state->ctx, gen_batch)) { LOGI("Break: decode fail"); break; }
+
+        state->recent_tokens.push_back(next_token);
+        if ((int)state->recent_tokens.size() > rep_penalty_range) {
+            state->recent_tokens.erase(state->recent_tokens.begin());
+        }
 
         // Get logits for next iteration
         const float *logits = llama_get_logits_ith(state->ctx, 0);
         if (!logits) { LOGI("Break: no logits after decode"); break; }
-        next_token = sample_token(logits, n_vocab);
+        next_token = sample_token(logits, n_vocab, state->recent_tokens);
     }
 
-    llama_batch_free(prompt_batch);
-    llama_batch_free(gen_batch);
-    LOGI("Generated %d bytes", (int)result_bytes.size());
+    state->kv_pos = n_pos;
+    LOGI("Generated %d bytes, kv_pos=%d", (int)result_bytes.size(), state->kv_pos);
 
     LOGI("Generated %d bytes", (int)result_bytes.size());
 
@@ -205,6 +242,11 @@ JNIEXPORT jstring JNICALL Java_com_ian_aigame_engine_NativeLLM_generate(
     jstring result = (jstring)env->NewObject(strCls, ctor, jbytes, cs);
     env->DeleteLocalRef(jbytes); env->DeleteLocalRef(cs); env->DeleteLocalRef(strCls);
     return result;
+}
+
+JNIEXPORT void JNICALL Java_com_ian_aigame_engine_NativeLLM_resetContext(JNIEnv *, jobject, jlong ptr) {
+    auto *state = reinterpret_cast<LlamaState *>(ptr);
+    if (state) state->kv_pos = 0;
 }
 
 JNIEXPORT void JNICALL Java_com_ian_aigame_engine_NativeLLM_close(JNIEnv *, jobject, jlong ptr) {

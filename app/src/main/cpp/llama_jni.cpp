@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <algorithm>
+#include <cstring>
+#include <errno.h>
 #include <android/log.h>
 
 #define LOG_TAG "LlamaJNI"
@@ -55,21 +57,54 @@ extern "C" {
 
 JNIEXPORT jlong JNICALL Java_com_ian_aigame_engine_NativeLLM_init(JNIEnv *env, jobject, jstring model_path) {
     srand(time(0));
+    LOGI("llama_backend_init start");
     llama_backend_init();
     const char *path = env->GetStringUTFChars(model_path, nullptr);
     LOGI("Loading model: %s", path);
+
+    // Check file access
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        LOGE("Cannot open model file: %s", strerror(errno));
+        env->ReleaseStringUTFChars(model_path, path);
+        return 0;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fclose(f);
+    LOGI("Model file size: %ld bytes (%.1f MB)", fsize, fsize / 1e6);
+
     auto mparams = llama_model_default_params();
     mparams.use_mmap = true;
+    LOGI("Calling llama_model_load_from_file...");
     llama_model *model = llama_model_load_from_file(path, mparams);
     env->ReleaseStringUTFChars(model_path, path);
-    if (!model) { LOGE("Model load failed"); return 0; }
+
+    if (!model) {
+        LOGE("llama_model_load_from_file returned null");
+        LOGI("Trying with use_mmap=false...");
+        // Retry without mmap
+        const char *path2 = env->GetStringUTFChars(model_path, nullptr);
+        auto mparams2 = llama_model_default_params();
+        mparams2.use_mmap = false;
+        model = llama_model_load_from_file(path2, mparams2);
+        env->ReleaseStringUTFChars(model_path, path2);
+        if (!model) {
+            LOGE("Both mmap and no-mmap failed. Model cannot be loaded.");
+            return 0;
+        }
+        LOGI("Model loaded with use_mmap=false");
+    }
+
+    LOGI("Creating context with n_ctx=2048");
     auto cparams = llama_context_default_params();
-    cparams.n_ctx = 4096;
+    cparams.n_ctx = 2048;
     llama_context *ctx = llama_init_from_model(model, cparams);
-    if (!ctx) { llama_model_free(model); return 0; }
+    if (!ctx) { LOGE("llama_init_from_model failed"); llama_model_free(model); return 0; }
+
     const llama_vocab *vocab = llama_model_get_vocab(model);
     auto *state = new LlamaState{model, ctx, vocab};
-    LOGI("Model loaded OK");
+    LOGI("Model loaded successfully, ptr=%p", state);
     return (jlong)state;
 }
 

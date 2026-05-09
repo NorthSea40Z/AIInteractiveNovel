@@ -122,7 +122,7 @@ class LocalInferenceEngine(private val appContext: Context) {
             }
             Log.i("AIGAME", "Narrative($round): $narrative")
 
-            val optionsRaw = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n請生成三個不同的選項讓玩家選擇：\n選項1：\n選項2：\n選項3：", 96) ?: "")
+            val optionsRaw = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n請生成三個不同方向的選項讓玩家選擇：\n選項1：\n選項2：\n選項3：", 160) ?: "")
                 .substringBefore("Human:").substringBefore("Assistant:").trim())
             Log.i("AIGAME", "Options raw($round): $optionsRaw")
             val options = parseOptions(optionsRaw, round)
@@ -232,7 +232,14 @@ class PromptBuilder {
     }
 
     private fun parseOptions(raw: String, round: Int): List<StoryOption> {
-        fun clean(s: String) = s.removePrefix("「").removeSuffix("」").removePrefix("\"").removeSuffix("\"").trim()
+        fun clean(s: String): String {
+            val text = s.removePrefix("「").removeSuffix("」").removePrefix("\"").removeSuffix("\"").trim()
+            val endings = setOf('\u3002', '\uFF01', '\uFF1F', '!', '?', '.')
+            return if (text.lastOrNull() in endings) text.take(60)
+            else text.indexOfLast { it in endings }.let { cut ->
+                if (cut >= 3) text.substring(0, cut + 1).take(60) else text.take(60)
+            }
+        }
         val opt1 = clean(raw.substringAfter("選項1：").substringBefore("\n").take(60))
         val opt2 = clean(raw.substringAfter("選項2：").substringBefore("\n").take(60))
         val opt3 = clean(raw.substringAfter("選項3：").substringBefore("\n").take(60))

@@ -84,7 +84,7 @@ class LocalInferenceEngine(private val appContext: Context) {
 
     suspend fun generateStoryPreview(theme: StoryTheme): StoryPreview = withContext(Dispatchers.Default) {
         if (nativePtr == 0L) return@withContext StoryPreview(title = "${theme.displayName} Adventure", opening = "Engine not ready", theme = theme, settings = com.ian.aigame.model.GameSettings(theme = theme))
-        NativeLLM.resetContext(nativePtr)
+        NativeLLM.clearContext(nativePtr)
         try {
             val response = NativeLLM.generate(nativePtr, "這是一個${theme.displayName}互動小說的起點。寫出開場情境，建立懸念，不要結局：\n", 128)
             Log.i("AIGAME", "Raw preview: $response")
@@ -107,20 +107,26 @@ class LocalInferenceEngine(private val appContext: Context) {
 
     suspend fun generateNextSegment(theme: StoryTheme, storySoFar: List<StorySegment>, round: Int, maxRounds: Int): StorySegment = withContext(Dispatchers.Default) {
         if (nativePtr == 0L) return@withContext segFallback(round)
-        NativeLLM.resetContext(nativePtr)
+        NativeLLM.clearContext(nativePtr)
         try {
             val context = buildStoryContext(theme, storySoFar, round, maxRounds)
             Log.i("AIGAME", "Generating segment $round, context: ${context.take(100)}...")
 
-            val narrative = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n\n故事繼續：", 128) ?: "")
+            val rawNarrative = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n\n故事繼續：", 128) ?: "")
                 .substringBefore("Human:").substringBefore("Assistant:").trim())
+            val endings = setOf('\u3002', '\uFF01', '\uFF1F', '!', '?', '.')
+            var narrative = rawNarrative
+            if (narrative.lastOrNull() !in endings) {
+                val cut = narrative.indexOfLast { it in endings }
+                if (cut >= 10) narrative = narrative.substring(0, cut + 1)
+            }
             Log.i("AIGAME", "Narrative($round): $narrative")
 
-            val opt1 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n玩家選擇：", 32) ?: "")
+            val opt1 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n給玩家一個行動選項：", 32) ?: "")
                 .substringBefore("Human:").substringBefore("Assistant:").trim())
-            val opt2 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n另一個選擇：", 32) ?: "")
+            val opt2 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n給玩家一個完全不同的選擇，不要跟上一個相同：", 32) ?: "")
                 .substringBefore("Human:").substringBefore("Assistant:").trim())
-            val opt3 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n第三個選擇：", 32) ?: "")
+            val opt3 = truncateRepetition((NativeLLM.generate(nativePtr, "$context\n$narrative\n\n給玩家第三個選擇，跟前面兩個都不同：", 32) ?: "")
                 .substringBefore("Human:").substringBefore("Assistant:").trim())
             Log.i("AIGAME", "Options($round): 1=$opt1 2=$opt2 3=$opt3")
 
@@ -131,7 +137,7 @@ class LocalInferenceEngine(private val appContext: Context) {
             )
 
             StorySegment(id = "seg_${round}_${System.currentTimeMillis()}",
-                narrative = narrative.ifBlank { "The story continues..." },
+                narrative = narrative.ifBlank { "故事繼續進行..." },
                 dialogue = null, speaker = null,
                 options = if (opts.isNotEmpty()) opts else segFallback(round).options
             )

@@ -7,6 +7,7 @@ import com.ian.aigame.engine.LocalInferenceEngine
 import com.ian.aigame.model.GameState
 import com.ian.aigame.model.StoryOption
 import com.ian.aigame.model.StoryPreview
+import com.ian.aigame.model.StorySegment
 import com.ian.aigame.model.StoryTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -76,7 +77,14 @@ class GameViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(currentScreen = Screen.GAME, isGeneratingSegment = true) }
 
         viewModelScope.launch(Dispatchers.Default) {
-            val firstSegment = inferenceEngine.generateNextSegment(settings.theme, emptyList(), 1, maxRounds)
+            val previewSegment = StorySegment(
+                id = "preview",
+                narrative = preview.opening,
+                dialogue = null,
+                speaker = null,
+                options = emptyList()
+            )
+            val firstSegment = inferenceEngine.generateNextSegment(settings.theme, listOf(previewSegment), 1, maxRounds)
             _gameState.update { it.copy(currentSegment = firstSegment, isGenerating = false, isPlaying = true, round = 1) }
             _uiState.update { it.copy(isGeneratingSegment = false) }
         }

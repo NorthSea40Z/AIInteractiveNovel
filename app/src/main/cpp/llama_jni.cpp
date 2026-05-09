@@ -244,9 +244,15 @@ JNIEXPORT jstring JNICALL Java_com_ian_aigame_engine_NativeLLM_generate(
     return result;
 }
 
-JNIEXPORT void JNICALL Java_com_ian_aigame_engine_NativeLLM_resetContext(JNIEnv *, jobject, jlong ptr) {
+JNIEXPORT void JNICALL Java_com_ian_aigame_engine_NativeLLM_clearContext(JNIEnv *, jobject, jlong ptr) {
     auto *state = reinterpret_cast<LlamaState *>(ptr);
-    if (state) state->kv_pos = 0;
+    if (!state || !state->model) return;
+    if (state->ctx) llama_free(state->ctx);
+    auto cparams = llama_context_default_params();
+    cparams.n_ctx = 16384;
+    state->ctx = llama_init_from_model(state->model, cparams);
+    state->vocab = llama_model_get_vocab(state->model);
+    state->kv_pos = 0;
 }
 
 JNIEXPORT void JNICALL Java_com_ian_aigame_engine_NativeLLM_close(JNIEnv *, jobject, jlong ptr) {
